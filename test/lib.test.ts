@@ -8,6 +8,8 @@ import {
   formatAlert,
   formatForbidden,
   formatReport,
+  formatUnknownContext,
+  parseContextArg,
   resolveWatchedNamespaces,
   type DeploymentLike,
 } from "../src/lib.ts"
@@ -100,9 +102,9 @@ test("recovered then bad again refires", () => {
 
 test("report and alert text list namespace, name and reason", () => {
   const [bad] = badDeployments([availableFalse]).values()
-  assert.equal(formatReport([], { watched: "default", skipped: [] }).endsWith("No Deployments are currently failing."), true)
+  assert.equal(formatReport([], { context: "dev", watched: "default", skipped: [] }).endsWith("No Deployments are currently failing."), true)
   assert.equal(
-    formatReport([bad!], { watched: "default", skipped: [] }).includes("- default/no-replicas: Available=False (MinimumReplicasUnavailable)"),
+    formatReport([bad!], { context: "dev", watched: "default", skipped: [] }).includes("- default/no-replicas: Available=False (MinimumReplicasUnavailable)"),
     true,
   )
   assert.equal(
@@ -130,9 +132,9 @@ test("watched namespaces are described for reports", () => {
   assert.equal(describeNamespaces({ namespaces: ["default", "prod"] }), "default, prod")
 })
 
-test("report names the watched and the forbidden skipped namespaces", () => {
-  const text = formatReport([], { watched: "default, prod", skipped: ["stage"] })
-  assert.equal(text.includes("Watching Deployments in default, prod."), true)
+test("report names the pinned context, the watched and the forbidden skipped namespaces", () => {
+  const text = formatReport([], { context: "tenant-a", watched: "default, prod", skipped: ["stage"] })
+  assert.equal(text.includes("Watching kubeconfig context tenant-a: default, prod."), true)
   assert.equal(text.includes("Skipped forbidden namespaces (this user cannot list Deployments there): stage."), true)
   assert.equal(text.endsWith("No Deployments are currently failing."), true)
 })
@@ -143,4 +145,20 @@ test("all-forbidden failure text explains the RBAC situation and the options", (
   assert.equal(text.includes("Ask the operator"), true)
   assert.equal(text.includes("namespaces`/`allNamespaces`"), true)
   assert.equal(text.includes("`kubectl auth can-i list deployments`"), true)
+})
+
+test("the --context flag is parsed from command text", () => {
+  assert.equal(parseContextArg("/k8s-watch --context=prod-cluster"), "prod-cluster")
+  assert.equal(parseContextArg("/k8s-watch --context prod-cluster"), "prod-cluster")
+  assert.equal(parseContextArg("please watch --context prod-cluster now"), "prod-cluster")
+  assert.equal(parseContextArg("/k8s-watch"), undefined)
+  assert.equal(parseContextArg("/k8s-watch stop"), undefined)
+  assert.equal(parseContextArg("/k8s-watch --context"), undefined)
+})
+
+test("unknown-context failure text names the requested context and lists the available ones", () => {
+  const text = formatUnknownContext("tenant-z", ["tenant-a", "tenant-b"])
+  assert.equal(text.includes("k8s-watch could not start: the kubeconfig has no context tenant-z."), true)
+  assert.equal(text.includes("Available contexts: tenant-a, tenant-b."), true)
+  assert.equal(text.includes("`--context` flag"), true)
 })

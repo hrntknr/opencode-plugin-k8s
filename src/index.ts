@@ -7,9 +7,12 @@ import {
   formatAlert,
   formatForbidden,
   formatReport,
+  formatUnknownContext,
+  parseContextArg,
   resolveWatchedNamespaces,
   type BadDeployment,
   type NamespaceOptions,
+  type WatchedNamespaces,
 } from "./lib.ts"
 
 type Delivery = "steer" | "queue"
@@ -17,9 +20,27 @@ type Delivery = "steer" | "queue"
 interface Options extends NamespaceOptions {
   intervalMs?: number
   labelSelector?: string
+  context?: string
+}
+
+type PinnedContext = {
+  context: string
+  namespaces: WatchedNamespaces
+}
+
+type UnknownContext = {
+  unknownContext: string
+  contexts: string[]
 }
 
 type WatchState = {
+  sessionID: string
+  bad: Record<string, BadDeployment>
+  context: string
+  namespaces: WatchedNamespaces
+}
+
+type LegacyWatchState = {
   sessionID: string
   bad: Record<string, BadDeployment>
 }
@@ -34,8 +55,6 @@ type ListResult = {
 const WATCH_KEY = "watch"
 const STOP_MESSAGE = "k8s-watch stopped. Failing Deployments are no longer reported."
 
-const contextNamespace = (kubeConfig: KubeConfig) => kubeConfig.getContextObject(kubeConfig.getCurrentContext())?.namespace
-
 const isForbidden = (error: unknown): boolean => error instanceof ApiException && error.code === 403
 
 export default Plugin.define({
@@ -47,32 +66,42 @@ export default Plugin.define({
     let timer: ReturnType<typeof setInterval> | undefined
     let state: WatchState | undefined
 
-    const listDeployments = async (): Promise<ListResult> => {
+    const resolvePinnedContext = (requested: string | undefined): PinnedContext | UnknownContext => {
       const kubeConfig = new KubeConfig()
       kubeConfig.loadFromDefault()
+      const contexts = kubeConfig.getContexts().map((context) => context.name)
+      const context = requested ?? options.context ?? kubeConfig.getCurrentContext()
+      if (!contexts.includes(context)) return { unknownContext: context, contexts }
+      return { context, namespaces: resolveWatchedNamespaces(options, kubeConfig.getContextObject(context)?.namespace) }
+    }
+
+    const listDeployments = async (pinned: PinnedContext): Promise<ListResult> => {
+      const kubeConfig = new KubeConfig()
+      kubeConfig.loadFromDefault()
+      kubeConfig.setCurrentContext(pinned.context)
       const api = kubeConfig.makeApiClient(AppsV1Api)
-      const targets = resolveWatchedNamespaces(options, contextNamespace(kubeConfig))
-      if ("all" in targets) {
+      const namespaces = pinned.namespaces
+      if ("all" in namespaces) {
         try {
           const list = await api.listDeploymentForAllNamespaces({ labelSelector: options.labelSelector })
-          return { deployments: list.items, watched: describeNamespaces(targets), skipped: [] }
+          return { deployments: list.items, watched: describeNamespaces(namespaces), skipped: [] }
         } catch (error) {
           if (!isForbidden(error)) throw error
-          return { deployments: [], watched: "", skipped: [], blocked: describeNamespaces(targets) }
+          return { deployments: [], watched: "", skipped: [], blocked: describeNamespaces(namespaces) }
         }
       }
       const results = await Promise.allSettled(
-        targets.namespaces.map((namespace) => api.listNamespacedDeployment({ namespace, labelSelector: options.labelSelector })),
+        namespaces.namespaces.map((namespace) => api.listNamespacedDeployment({ namespace, labelSelector: options.labelSelector })),
       )
       const deployments: V1Deployment[] = []
       const skipped: string[] = []
       for (const [index, result] of results.entries()) {
         if (result.status === "fulfilled") deployments.push(...result.value.items)
-        else if (isForbidden(result.reason)) skipped.push(targets.namespaces[index])
+        else if (isForbidden(result.reason)) skipped.push(namespaces.namespaces[index])
         else throw result.reason
       }
-      const accessible = targets.namespaces.filter((namespace) => !skipped.includes(namespace))
-      if (accessible.length === 0) return { deployments, watched: "", skipped, blocked: describeNamespaces(targets) }
+      const accessible = namespaces.namespaces.filter((namespace) => !skipped.includes(namespace))
+      if (accessible.length === 0) return { deployments, watched: "", skipped, blocked: describeNamespaces(namespaces) }
       return { deployments, watched: describeNamespaces({ namespaces: accessible }), skipped }
     }
 
@@ -83,14 +112,14 @@ export default Plugin.define({
       for (const deployment of diffBad(current, new Map(Object.entries(state.bad)))) {
         await kick(state.sessionID, formatAlert(deployment), "queue")
       }
-      state = { sessionID: state.sessionID, bad: Object.fromEntries(current) }
+      state = { ...state, bad: Object.fromEntries(current) }
       await ctx.storage.set(WATCH_KEY, state)
     }
 
     const poll = async () => {
       if (!state) return
       try {
-        const { deployments } = await listDeployments()
+        const { deployments } = await listDeployments(state)
         await sync(badDeployments(deployments))
       } catch (error) {
         console.error("k8s-watch: polling deployments failed", error)
@@ -109,11 +138,18 @@ export default Plugin.define({
       await ctx.storage.remove(WATCH_KEY)
     }
 
-    const startWatch = async (sessionID: string): Promise<string> => {
+    const startWatch = async (sessionID: string, requested: string | undefined): Promise<string> => {
       clearInterval(timer)
+      let pinned: PinnedContext
       let result: ListResult
       try {
-        result = await listDeployments()
+        const resolution = resolvePinnedContext(requested)
+        if ("unknownContext" in resolution) {
+          await disarm()
+          return formatUnknownContext(resolution.unknownContext, resolution.contexts)
+        }
+        pinned = resolution
+        result = await listDeployments(pinned)
       } catch (error) {
         console.error("k8s-watch: listing deployments failed", error)
         await disarm()
@@ -125,10 +161,24 @@ export default Plugin.define({
         return formatForbidden(result.blocked)
       }
       const current = badDeployments(result.deployments)
-      state = { sessionID, bad: Object.fromEntries(current) }
+      state = { sessionID, bad: Object.fromEntries(current), context: pinned.context, namespaces: pinned.namespaces }
       await ctx.storage.set(WATCH_KEY, state)
       arm()
-      return formatReport([...current.values()], { watched: result.watched, skipped: result.skipped })
+      return formatReport([...current.values()], { context: pinned.context, watched: result.watched, skipped: result.skipped })
+    }
+
+    const upgradeLegacy = async (stored: LegacyWatchState): Promise<void> => {
+      try {
+        const pinned = resolvePinnedContext(undefined)
+        if ("unknownContext" in pinned) {
+          await disarm()
+          return
+        }
+        state = { ...stored, ...pinned }
+        await ctx.storage.set(WATCH_KEY, state)
+      } catch (error) {
+        console.error("k8s-watch: resuming the stored watch failed", error)
+      }
     }
 
     const commandRegistration = await ctx.command.transform((editor) => {
@@ -141,7 +191,7 @@ export default Plugin.define({
             await kick(sessionID, STOP_MESSAGE, delivery)
             return
           }
-          await kick(sessionID, await startWatch(sessionID), delivery)
+          await kick(sessionID, await startWatch(sessionID, parseContextArg(prompt.text)), delivery)
         },
       })
     })
@@ -151,29 +201,33 @@ export default Plugin.define({
       editor.add({
         name: "watch",
         description:
-          "Watch Kubernetes Deployments for failures in this session. Use action=start to begin reporting newly failing Deployments here (returns the currently failing ones); action=stop to stop the watch.",
+          "Watch Kubernetes Deployments for failures in this session. Use action=start to begin reporting newly failing Deployments here (returns the currently failing ones); action=stop to stop the watch. Pass context to name the kubeconfig context to watch; without it the kubeconfig current context is used.",
         input: {
           type: "object",
-          properties: { action: { type: "string", enum: ["start", "stop"] } },
+          properties: {
+            action: { type: "string", enum: ["start", "stop"] },
+            context: { type: "string" },
+          },
           required: ["action"],
           additionalProperties: false,
         },
         options: { namespace: "k8s" },
         execute: async (input, context) => {
-          const { action } = input as { action: "start" | "stop" }
+          const { action, context: requested } = input as { action: "start" | "stop"; context?: string }
           if (action === "stop") {
             await disarm()
             return { content: STOP_MESSAGE }
           }
-          return { content: await startWatch(context.sessionID) }
+          return { content: await startWatch(context.sessionID, requested) }
         },
       })
     })
 
-    const stored = (await ctx.storage.get(WATCH_KEY)) as WatchState | undefined
+    const stored = (await ctx.storage.get(WATCH_KEY)) as WatchState | LegacyWatchState | undefined
     if (stored) {
-      state = stored
-      arm()
+      if ("context" in stored) state = stored
+      else await upgradeLegacy(stored)
+      if (state) arm()
     }
 
     return async () => {
