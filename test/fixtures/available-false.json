@@ -1,0 +1,15 @@
+{
+  "apiVersion": "apps/v1",
+  "kind": "Deployment",
+  "metadata": {
+    "uid": "22222222-2222-2222-2222-222222222222",
+    "name": "no-replicas",
+    "namespace": "default"
+  },
+  "status": {
+    "conditions": [
+      { "type": "Available", "status": "False", "reason": "MinimumReplicasUnavailable" },
+      { "type": "Progressing", "status": "True", "reason": "ReplicaSetUpdated" }
+    ]
+  }
+}

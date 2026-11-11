@@ -1,0 +1,16 @@
+{
+  "apiVersion": "apps/v1",
+  "kind": "Deployment",
+  "metadata": {
+    "uid": "44444444-4444-4444-4444-444444444444",
+    "name": "quota-exceeded",
+    "namespace": "ws"
+  },
+  "status": {
+    "conditions": [
+      { "type": "Available", "status": "True", "reason": "MinimumReplicasAvailable" },
+      { "type": "Progressing", "status": "True", "reason": "ReplicaSetUpdated" },
+      { "type": "ReplicaFailure", "status": "True", "reason": "FailedCreate" }
+    ]
+  }
+}

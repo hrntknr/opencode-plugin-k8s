@@ -1,0 +1,15 @@
+{
+  "apiVersion": "apps/v1",
+  "kind": "Deployment",
+  "metadata": {
+    "uid": "66666666-6666-6666-6666-666666666666",
+    "name": "paused",
+    "namespace": "default"
+  },
+  "status": {
+    "conditions": [
+      { "type": "Available", "status": "True", "reason": "MinimumReplicasAvailable" },
+      { "type": "Progressing", "status": "False", "reason": "DeploymentPaused" }
+    ]
+  }
+}

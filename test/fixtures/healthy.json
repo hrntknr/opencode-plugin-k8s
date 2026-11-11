@@ -1,0 +1,15 @@
+{
+  "apiVersion": "apps/v1",
+  "kind": "Deployment",
+  "metadata": {
+    "uid": "11111111-1111-1111-1111-111111111111",
+    "name": "healthy",
+    "namespace": "default"
+  },
+  "status": {
+    "conditions": [
+      { "type": "Available", "status": "True", "reason": "MinimumReplicasAvailable" },
+      { "type": "Progressing", "status": "True", "reason": "NewReplicaSetAvailable" }
+    ]
+  }
+}

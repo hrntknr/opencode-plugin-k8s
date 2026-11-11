@@ -1,0 +1,15 @@
+{
+  "apiVersion": "apps/v1",
+  "kind": "Deployment",
+  "metadata": {
+    "uid": "33333333-3333-3333-3333-333333333333",
+    "name": "timed-out",
+    "namespace": "prod"
+  },
+  "status": {
+    "conditions": [
+      { "type": "Available", "status": "True", "reason": "MinimumReplicasAvailable" },
+      { "type": "Progressing", "status": "False", "reason": "ProgressDeadlineExceeded" }
+    ]
+  }
+}
