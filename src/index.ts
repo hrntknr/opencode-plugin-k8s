@@ -6,9 +6,13 @@ import {
   diffBad,
   formatAlert,
   formatForbidden,
+  formatIdleStatus,
+  formatReasonChange,
   formatReport,
+  formatStatus,
   formatUnknownContext,
   parseContextArg,
+  reasonChanges,
   resolveWatchedNamespaces,
   type BadDeployment,
   type NamespaceOptions,
@@ -109,8 +113,12 @@ export default Plugin.define({
 
     const sync = async (current: Map<string, BadDeployment>) => {
       if (!state) return
-      for (const deployment of diffBad(current, new Map(Object.entries(state.bad)))) {
+      const previous = new Map(Object.entries(state.bad))
+      for (const deployment of diffBad(current, previous)) {
         await kick(state.sessionID, formatAlert(deployment), "queue")
+      }
+      for (const change of reasonChanges(current, previous)) {
+        await kick(state.sessionID, formatReasonChange(change), "queue")
       }
       state = { ...state, bad: Object.fromEntries(current) }
       await ctx.storage.set(WATCH_KEY, state)
@@ -181,14 +189,28 @@ export default Plugin.define({
       }
     }
 
+    const statusText = (): string => {
+      if (!state) return formatIdleStatus()
+      return formatStatus(Object.values(state.bad), {
+        context: state.context,
+        watched: describeNamespaces(state.namespaces),
+        intervalMs,
+      })
+    }
+
     const commandRegistration = await ctx.command.transform((editor) => {
       editor.add({
         name: "k8s-watch",
-        description: "Watch Kubernetes Deployments for failures and report them in this session. Stop the watch with: stop",
+        description:
+          "Watch Kubernetes Deployments for failures and report them in this session. Stop the watch with: stop. Show the watch status with: status",
         execute: async ({ sessionID, prompt, delivery }) => {
           if (/\bstop\b/i.test(prompt.text)) {
             await disarm()
             await kick(sessionID, STOP_MESSAGE, delivery)
+            return
+          }
+          if (/\bstatus\b/i.test(prompt.text)) {
+            await kick(sessionID, statusText(), delivery)
             return
           }
           await kick(sessionID, await startWatch(sessionID, parseContextArg(prompt.text)), delivery)
@@ -201,11 +223,11 @@ export default Plugin.define({
       editor.add({
         name: "watch",
         description:
-          "Watch Kubernetes Deployments for failures in this session. Use action=start to begin reporting newly failing Deployments here (returns the currently failing ones); action=stop to stop the watch. Pass context to name the kubeconfig context to watch; without it the kubeconfig current context is used.",
+          "Watch Kubernetes Deployments for failures in this session. Use action=start to begin reporting newly failing Deployments here (returns the currently failing ones); action=stop to stop the watch. Pass context to name the kubeconfig context to watch; without it the kubeconfig current context is used. Use action=status to see what is being watched and what is currently failing.",
         input: {
           type: "object",
           properties: {
-            action: { type: "string", enum: ["start", "stop"] },
+            action: { type: "string", enum: ["start", "stop", "status"] },
             context: { type: "string" },
           },
           required: ["action"],
@@ -213,11 +235,12 @@ export default Plugin.define({
         },
         options: { namespace: "k8s" },
         execute: async (input, context) => {
-          const { action, context: requested } = input as { action: "start" | "stop"; context?: string }
+          const { action, context: requested } = input as { action: "start" | "stop" | "status"; context?: string }
           if (action === "stop") {
             await disarm()
             return { content: STOP_MESSAGE }
           }
+          if (action === "status") return { content: statusText() }
           return { content: await startWatch(context.sessionID, requested) }
         },
       })

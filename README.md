@@ -12,8 +12,9 @@ Run `/k8s-watch` in a session to start watching. The plugin:
 - pins the context and the watched namespaces when the watch starts, and reloads the kubeconfig on every poll only to refresh short-lived credentials (OIDC, exec); switching the machine's current context (`kubectl config use-context`) does not affect a running watch,
 - skips namespaces whose list call is forbidden (HTTP 403) instead of failing the watch when several namespaces are watched, and names both the watched and the skipped namespaces in the start report,
 - treats a Deployment as failing when its `Available` condition is `False`, its `Progressing` condition is `False` with reason `ProgressDeadlineExceeded`, or its `ReplicaFailure` condition is `True`,
-- injects an initial report of the currently failing Deployments into the starting session,
+- injects an initial report of the currently failing Deployments into the starting session; the report includes the plugin version,
 - re-lists the Deployments on every poll and injects a prompt for each newly failing Deployment with `delivery: "queue"`, so the agent investigates it without interrupting an in-flight turn,
+- re-notifies with the old and the new conditions when the reasons of an already-failing Deployment change (for example `MinimumReplicasUnavailable` becoming `ProgressDeadlineExceeded`),
 - keeps the failing set in plugin storage, so a plugin reload resumes the watch without re-reporting already known failures.
 
 Deployments that recover leave the failing set silently; if the same Deployment fails again later, it is reported again.
@@ -66,13 +67,14 @@ Run in the session that should investigate the failing Deployments:
 /k8s-watch --context <name>
 /k8s-watch --context=<name>
 /k8s-watch stop
+/k8s-watch status
 ```
 
-The optional `--context` flag selects the kubeconfig context to watch; without it the current context is used.
+The optional `--context` flag selects the kubeconfig context to watch; without it the current context is used. `/k8s-watch status` reports the pinned context, the watched namespaces, the poll interval and the currently failing Deployments; it never starts, stops or changes the running watch.
 
 ### Agent usage
 
-The model can also start and stop the watch itself with the `k8s_watch` tool; asking it to "watch the cluster" in a session is enough. The tool's optional `context` parameter selects the kubeconfig context, like the command's `--context` flag. The initial report of currently failing Deployments is returned as the tool result, and later failures are queued into the session as prompts, just like with the command.
+The model can also start, stop and check the watch itself with the `k8s_watch` tool; asking it to "watch the cluster" in a session is enough. The tool's optional `context` parameter selects the kubeconfig context, like the command's `--context` flag. The initial report of currently failing Deployments is returned as the tool result, and later failures are queued into the session as prompts, just like with the command. The tool's `status` action reports what is being watched and what is currently failing without changing the watch.
 
 ## Development
 

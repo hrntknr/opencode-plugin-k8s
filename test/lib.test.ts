@@ -7,10 +7,15 @@ import {
   diffBad,
   formatAlert,
   formatForbidden,
+  formatIdleStatus,
+  formatReasonChange,
   formatReport,
+  formatStatus,
   formatUnknownContext,
   parseContextArg,
+  reasonChanges,
   resolveWatchedNamespaces,
+  VERSION,
   type DeploymentLike,
 } from "../src/lib.ts"
 import flapBad from "./fixtures/flap-bad.json" with { type: "json" }
@@ -100,8 +105,65 @@ test("recovered then bad again refires", () => {
   assert.equal(poll([flapBad]).length, 1)
 })
 
+const minimumReplicas: DeploymentLike = {
+  metadata: { uid: "22222222-2222-2222-2222-222222222222", namespace: "default", name: "no-replicas" },
+  status: { conditions: [{ type: "Available", status: "False", reason: "MinimumReplicasUnavailable" }] },
+}
+const deadlineExceeded: DeploymentLike = {
+  metadata: { uid: "22222222-2222-2222-2222-222222222222", namespace: "default", name: "no-replicas" },
+  status: { conditions: [{ type: "Progressing", status: "False", reason: "ProgressDeadlineExceeded" }] },
+}
+
+test("a reason change on a still-bad deployment fires once", () => {
+  let previous = badDeployments([minimumReplicas])
+  const poll = (deployments: readonly DeploymentLike[]) => {
+    const current = badDeployments(deployments)
+    const changes = reasonChanges(current, previous)
+    previous = current
+    return changes
+  }
+  assert.equal(poll([minimumReplicas]).length, 0)
+  const [change] = poll([deadlineExceeded])
+  assert.deepEqual(change, {
+    namespace: "default",
+    name: "no-replicas",
+    from: "Available=False (MinimumReplicasUnavailable)",
+    to: "Progressing=False (ProgressDeadlineExceeded)",
+  })
+  assert.equal(poll([deadlineExceeded]).length, 0)
+})
+
+test("newly bad and reason changed are disjoint in the same poll", () => {
+  const previous = badDeployments([minimumReplicas])
+  const current = badDeployments([deadlineExceeded, progressingDeadline])
+  assert.deepEqual(diffBad(current, previous).map(describeDeployment), [
+    "prod/timed-out: Progressing=False (ProgressDeadlineExceeded)",
+  ])
+  assert.deepEqual(reasonChanges(current, previous), [
+    {
+      namespace: "default",
+      name: "no-replicas",
+      from: "Available=False (MinimumReplicasUnavailable)",
+      to: "Progressing=False (ProgressDeadlineExceeded)",
+    },
+  ])
+})
+
+test("reason-change alerts say the deployment is still failing", () => {
+  assert.equal(
+    formatReasonChange({
+      namespace: "default",
+      name: "no-replicas",
+      from: "Available=False (MinimumReplicasUnavailable)",
+      to: "Progressing=False (ProgressDeadlineExceeded)",
+    }),
+    "k8s-watch: Deployment default/no-replicas is still failing, conditions changed: Available=False (MinimumReplicasUnavailable) → Progressing=False (ProgressDeadlineExceeded). Check whether it needs intervention.",
+  )
+})
+
 test("report and alert text list namespace, name and reason", () => {
   const [bad] = badDeployments([availableFalse]).values()
+  assert.equal(formatReport([], { context: "dev", watched: "default", skipped: [] }).startsWith(`k8s-watch (v${VERSION}):`), true)
   assert.equal(formatReport([], { context: "dev", watched: "default", skipped: [] }).endsWith("No Deployments are currently failing."), true)
   assert.equal(
     formatReport([bad!], { context: "dev", watched: "default", skipped: [] }).includes("- default/no-replicas: Available=False (MinimumReplicasUnavailable)"),
@@ -137,6 +199,24 @@ test("report names the pinned context, the watched and the forbidden skipped nam
   assert.equal(text.includes("Watching kubeconfig context tenant-a: default, prod."), true)
   assert.equal(text.includes("Skipped forbidden namespaces (this user cannot list Deployments there): stage."), true)
   assert.equal(text.endsWith("No Deployments are currently failing."), true)
+})
+
+test("status text names the context, the watched namespaces, the interval and the current failures", () => {
+  const [bad] = badDeployments([availableFalse]).values()
+  const text = formatStatus([bad!], { context: "dev", watched: "default", intervalMs: 45000 })
+  assert.equal(text.startsWith(`k8s-watch (v${VERSION}): the watch is running.`), true)
+  assert.equal(text.includes("Watching kubeconfig context dev: default."), true)
+  assert.equal(text.includes("Polling every 45000 ms."), true)
+  assert.equal(text.includes("- default/no-replicas: Available=False (MinimumReplicasUnavailable)"), true)
+})
+
+test("status text with nothing failing says so", () => {
+  const text = formatStatus([], { context: "dev", watched: "all namespaces", intervalMs: 30000 })
+  assert.equal(text.endsWith("No Deployments are currently failing."), true)
+})
+
+test("idle status text carries the version and how to start", () => {
+  assert.equal(formatIdleStatus(), `k8s-watch (v${VERSION}): no watch is running. Start one with action=start.`)
 })
 
 test("all-forbidden failure text explains the RBAC situation and the options", () => {

@@ -1,7 +1,16 @@
+export const VERSION = "1.4.0"
+
 export type BadDeployment = {
   namespace: string
   name: string
   reason: string
+}
+
+export type ReasonChange = {
+  namespace: string
+  name: string
+  from: string
+  to: string
 }
 
 export interface DeploymentLike {
@@ -46,6 +55,16 @@ export function diffBad(current: Map<string, BadDeployment>, previous: Map<strin
   return fresh
 }
 
+export function reasonChanges(current: Map<string, BadDeployment>, previous: Map<string, BadDeployment>): ReasonChange[] {
+  const changes: ReasonChange[] = []
+  for (const [key, deployment] of current) {
+    const before = previous.get(key)
+    if (before === undefined || before.reason === deployment.reason) continue
+    changes.push({ namespace: deployment.namespace, name: deployment.name, from: before.reason, to: deployment.reason })
+  }
+  return changes
+}
+
 export function describeDeployment(deployment: BadDeployment): string {
   return `${deployment.namespace}/${deployment.name}: ${deployment.reason}`
 }
@@ -77,19 +96,38 @@ export interface ReportScope {
   skipped: string[]
 }
 
+function badListLines(bad: readonly BadDeployment[]): string[] {
+  if (bad.length === 0) return ["No Deployments are currently failing."]
+  return ["Failing Deployments, investigate these:", ...bad.map((deployment) => `- ${describeDeployment(deployment)}`)]
+}
+
 export function formatReport(bad: readonly BadDeployment[], scope: ReportScope): string {
   const lines = [
-    "k8s-watch: a watcher for failing Kubernetes Deployments has started. It reports newly failing Deployments in this session.",
+    `k8s-watch (v${VERSION}): a watcher for failing Kubernetes Deployments has started. It reports newly failing Deployments in this session.`,
     `Watching kubeconfig context ${scope.context}: ${scope.watched}.`,
   ]
   if (scope.skipped.length > 0)
     lines.push(`Skipped forbidden namespaces (this user cannot list Deployments there): ${scope.skipped.join(", ")}.`)
-  if (bad.length === 0) lines.push("No Deployments are currently failing.")
-  else {
-    lines.push("Failing Deployments, investigate these:")
-    for (const deployment of bad) lines.push(`- ${describeDeployment(deployment)}`)
-  }
-  return lines.join("\n")
+  return [...lines, ...badListLines(bad)].join("\n")
+}
+
+export interface StatusScope {
+  context: string
+  watched: string
+  intervalMs: number
+}
+
+export function formatStatus(bad: readonly BadDeployment[], scope: StatusScope): string {
+  return [
+    `k8s-watch (v${VERSION}): the watch is running.`,
+    `Watching kubeconfig context ${scope.context}: ${scope.watched}.`,
+    `Polling every ${scope.intervalMs} ms.`,
+    ...badListLines(bad),
+  ].join("\n")
+}
+
+export function formatIdleStatus(): string {
+  return `k8s-watch (v${VERSION}): no watch is running. Start one with action=start.`
 }
 
 export function formatForbidden(namespaces: string): string {
@@ -110,4 +148,8 @@ export function formatUnknownContext(context: string, contexts: string[]): strin
 
 export function formatAlert(deployment: BadDeployment): string {
   return `k8s-watch: Deployment ${deployment.namespace}/${deployment.name} just became unhealthy: ${deployment.reason}. Investigate it (rollout status, events, pod logs) and report what is wrong.`
+}
+
+export function formatReasonChange(change: ReasonChange): string {
+  return `k8s-watch: Deployment ${change.namespace}/${change.name} is still failing, conditions changed: ${change.from} → ${change.to}. Check whether it needs intervention.`
 }
