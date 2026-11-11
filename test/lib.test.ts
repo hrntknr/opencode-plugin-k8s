@@ -1,6 +1,16 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { badDeployments, diffBad, describeDeployment, formatAlert, formatReport, type DeploymentLike } from "../src/lib.ts"
+import {
+  badDeployments,
+  describeDeployment,
+  describeNamespaces,
+  diffBad,
+  formatAlert,
+  formatForbidden,
+  formatReport,
+  resolveWatchedNamespaces,
+  type DeploymentLike,
+} from "../src/lib.ts"
 import flapBad from "./fixtures/flap-bad.json" with { type: "json" }
 import flapHealthy from "./fixtures/flap-healthy.json" with { type: "json" }
 import healthy from "./fixtures/healthy.json" with { type: "json" }
@@ -90,10 +100,47 @@ test("recovered then bad again refires", () => {
 
 test("report and alert text list namespace, name and reason", () => {
   const [bad] = badDeployments([availableFalse]).values()
-  assert.equal(formatReport([]).endsWith("No Deployments are currently failing."), true)
-  assert.equal(formatReport([bad!]).includes("- default/no-replicas: Available=False (MinimumReplicasUnavailable)"), true)
+  assert.equal(formatReport([], { watched: "default", skipped: [] }).endsWith("No Deployments are currently failing."), true)
+  assert.equal(
+    formatReport([bad!], { watched: "default", skipped: [] }).includes("- default/no-replicas: Available=False (MinimumReplicasUnavailable)"),
+    true,
+  )
   assert.equal(
     formatAlert(bad!),
     "k8s-watch: Deployment default/no-replicas just became unhealthy: Available=False (MinimumReplicasUnavailable). Investigate it (rollout status, events, pod logs) and report what is wrong.",
   )
+})
+
+test("allNamespaces resolves to the cluster scope", () => {
+  assert.deepEqual(resolveWatchedNamespaces({ allNamespaces: true }, "stage"), { all: true })
+  assert.deepEqual(resolveWatchedNamespaces({ allNamespaces: true, namespaces: ["prod"] }, "stage"), { all: true })
+})
+
+test("configured namespaces win over the context namespace", () => {
+  assert.deepEqual(resolveWatchedNamespaces({ namespaces: ["default", "prod"] }, "stage"), { namespaces: ["default", "prod"] })
+})
+
+test("without options the kubeconfig context namespace is watched", () => {
+  assert.deepEqual(resolveWatchedNamespaces({}, "stage"), { namespaces: ["stage"] })
+  assert.deepEqual(resolveWatchedNamespaces({ allNamespaces: false, namespaces: [] }, undefined), { namespaces: ["default"] })
+})
+
+test("watched namespaces are described for reports", () => {
+  assert.equal(describeNamespaces({ all: true }), "all namespaces")
+  assert.equal(describeNamespaces({ namespaces: ["default", "prod"] }), "default, prod")
+})
+
+test("report names the watched and the forbidden skipped namespaces", () => {
+  const text = formatReport([], { watched: "default, prod", skipped: ["stage"] })
+  assert.equal(text.includes("Watching Deployments in default, prod."), true)
+  assert.equal(text.includes("Skipped forbidden namespaces (this user cannot list Deployments there): stage."), true)
+  assert.equal(text.endsWith("No Deployments are currently failing."), true)
+})
+
+test("all-forbidden failure text explains the RBAC situation and the options", () => {
+  const text = formatForbidden("stage, sandbox")
+  assert.equal(text.includes("not allowed to list Deployments in stage, sandbox (HTTP 403)"), true)
+  assert.equal(text.includes("Ask the operator"), true)
+  assert.equal(text.includes("namespaces`/`allNamespaces`"), true)
+  assert.equal(text.includes("`kubectl auth can-i list deployments`"), true)
 })

@@ -50,16 +50,49 @@ export function describeDeployment(deployment: BadDeployment): string {
   return `${deployment.namespace}/${deployment.name}: ${deployment.reason}`
 }
 
-export function formatReport(bad: readonly BadDeployment[]): string {
+export type WatchedNamespaces = { all: true } | { namespaces: string[] }
+
+export interface NamespaceOptions {
+  allNamespaces?: boolean
+  namespaces?: string[]
+}
+
+export function resolveWatchedNamespaces(options: NamespaceOptions, contextNamespace: string | undefined): WatchedNamespaces {
+  if (options.allNamespaces === true) return { all: true }
+  if (options.namespaces?.length) return { namespaces: options.namespaces }
+  return { namespaces: [contextNamespace ?? "default"] }
+}
+
+export function describeNamespaces(namespaces: WatchedNamespaces): string {
+  return "all" in namespaces ? "all namespaces" : namespaces.namespaces.join(", ")
+}
+
+export interface ReportScope {
+  watched: string
+  skipped: string[]
+}
+
+export function formatReport(bad: readonly BadDeployment[], scope: ReportScope): string {
   const lines = [
     "k8s-watch: a watcher for failing Kubernetes Deployments has started. It reports newly failing Deployments in this session.",
+    `Watching Deployments in ${scope.watched}.`,
   ]
+  if (scope.skipped.length > 0)
+    lines.push(`Skipped forbidden namespaces (this user cannot list Deployments there): ${scope.skipped.join(", ")}.`)
   if (bad.length === 0) lines.push("No Deployments are currently failing.")
   else {
     lines.push("Failing Deployments, investigate these:")
     for (const deployment of bad) lines.push(`- ${describeDeployment(deployment)}`)
   }
   return lines.join("\n")
+}
+
+export function formatForbidden(namespaces: string): string {
+  return [
+    `k8s-watch could not start: this user is not allowed to list Deployments in ${namespaces} (HTTP 403).`,
+    "Ask the operator for permission to list Deployments there, or change the `namespaces`/`allNamespaces` plugin options to point at namespaces this user can list.",
+    "Check what you can list with `kubectl auth can-i list deployments`.",
+  ].join("\n")
 }
 
 export function formatAlert(deployment: BadDeployment): string {

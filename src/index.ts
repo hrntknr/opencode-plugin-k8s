@@ -1,12 +1,21 @@
 import { Plugin } from "@opencode/plugin"
-import { AppsV1Api, KubeConfig, type V1Deployment } from "@kubernetes/client-node"
-import { badDeployments, diffBad, formatAlert, formatReport, type BadDeployment } from "./lib.ts"
+import { ApiException, AppsV1Api, KubeConfig, type V1Deployment } from "@kubernetes/client-node"
+import {
+  badDeployments,
+  describeNamespaces,
+  diffBad,
+  formatAlert,
+  formatForbidden,
+  formatReport,
+  resolveWatchedNamespaces,
+  type BadDeployment,
+  type NamespaceOptions,
+} from "./lib.ts"
 
 type Delivery = "steer" | "queue"
 
-interface Options {
+interface Options extends NamespaceOptions {
   intervalMs?: number
-  namespaces?: string[]
   labelSelector?: string
 }
 
@@ -15,8 +24,19 @@ type WatchState = {
   bad: Record<string, BadDeployment>
 }
 
+type ListResult = {
+  deployments: V1Deployment[]
+  watched: string
+  skipped: string[]
+  blocked?: string
+}
+
 const WATCH_KEY = "watch"
 const STOP_MESSAGE = "k8s-watch stopped. Failing Deployments are no longer reported."
+
+const contextNamespace = (kubeConfig: KubeConfig) => kubeConfig.getContextObject(kubeConfig.getCurrentContext())?.namespace
+
+const isForbidden = (error: unknown): boolean => error instanceof ApiException && error.code === 403
 
 export default Plugin.define({
   id: "k8s",
@@ -27,16 +47,33 @@ export default Plugin.define({
     let timer: ReturnType<typeof setInterval> | undefined
     let state: WatchState | undefined
 
-    const listDeployments = async (): Promise<V1Deployment[]> => {
+    const listDeployments = async (): Promise<ListResult> => {
       const kubeConfig = new KubeConfig()
       kubeConfig.loadFromDefault()
       const api = kubeConfig.makeApiClient(AppsV1Api)
-      const lists = options.namespaces?.length
-        ? await Promise.all(
-            options.namespaces.map((namespace) => api.listNamespacedDeployment({ namespace, labelSelector: options.labelSelector })),
-          )
-        : [await api.listDeploymentForAllNamespaces({ labelSelector: options.labelSelector })]
-      return lists.flatMap((list) => list.items)
+      const targets = resolveWatchedNamespaces(options, contextNamespace(kubeConfig))
+      if ("all" in targets) {
+        try {
+          const list = await api.listDeploymentForAllNamespaces({ labelSelector: options.labelSelector })
+          return { deployments: list.items, watched: describeNamespaces(targets), skipped: [] }
+        } catch (error) {
+          if (!isForbidden(error)) throw error
+          return { deployments: [], watched: "", skipped: [], blocked: describeNamespaces(targets) }
+        }
+      }
+      const results = await Promise.allSettled(
+        targets.namespaces.map((namespace) => api.listNamespacedDeployment({ namespace, labelSelector: options.labelSelector })),
+      )
+      const deployments: V1Deployment[] = []
+      const skipped: string[] = []
+      for (const [index, result] of results.entries()) {
+        if (result.status === "fulfilled") deployments.push(...result.value.items)
+        else if (isForbidden(result.reason)) skipped.push(targets.namespaces[index])
+        else throw result.reason
+      }
+      const accessible = targets.namespaces.filter((namespace) => !skipped.includes(namespace))
+      if (accessible.length === 0) return { deployments, watched: "", skipped, blocked: describeNamespaces(targets) }
+      return { deployments, watched: describeNamespaces({ namespaces: accessible }), skipped }
     }
 
     const kick = (sessionID: string, text: string, delivery: Delivery) => ctx.session.prompt({ sessionID, text, delivery })
@@ -53,7 +90,8 @@ export default Plugin.define({
     const poll = async () => {
       if (!state) return
       try {
-        await sync(badDeployments(await listDeployments()))
+        const { deployments } = await listDeployments()
+        await sync(badDeployments(deployments))
       } catch (error) {
         console.error("k8s-watch: polling deployments failed", error)
       }
@@ -73,19 +111,24 @@ export default Plugin.define({
 
     const startWatch = async (sessionID: string): Promise<string> => {
       clearInterval(timer)
-      let current: Map<string, BadDeployment>
+      let result: ListResult
       try {
-        current = badDeployments(await listDeployments())
+        result = await listDeployments()
       } catch (error) {
         console.error("k8s-watch: listing deployments failed", error)
         await disarm()
         const message = error instanceof Error ? error.message : String(error)
         return `k8s-watch could not list deployments: ${message}. Check that kubectl reaches your cluster (for example with \`kubectl get deployments\`), then start the watch again.`
       }
+      if (result.blocked !== undefined) {
+        await disarm()
+        return formatForbidden(result.blocked)
+      }
+      const current = badDeployments(result.deployments)
       state = { sessionID, bad: Object.fromEntries(current) }
       await ctx.storage.set(WATCH_KEY, state)
       arm()
-      return formatReport([...current.values()])
+      return formatReport([...current.values()], { watched: result.watched, skipped: result.skipped })
     }
 
     const commandRegistration = await ctx.command.transform((editor) => {
