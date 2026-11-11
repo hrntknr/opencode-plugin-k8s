@@ -59,6 +59,10 @@ Run in the session that should investigate the failing Deployments:
 /k8s-watch stop
 ```
 
+### Agent usage
+
+The model can also start and stop the watch itself with the `k8s_watch` tool; asking it to "watch the cluster" in a session is enough. The initial report of currently failing Deployments is returned as the tool result, and later failures are queued into the session as prompts, just like with the command.
+
 ## Development
 
 ```sh

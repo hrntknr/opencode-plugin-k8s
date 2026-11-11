@@ -16,6 +16,7 @@ type WatchState = {
 }
 
 const WATCH_KEY = "watch"
+const STOP_MESSAGE = "k8s-watch stopped. Failing Deployments are no longer reported."
 
 export default Plugin.define({
   id: "k8s",
@@ -70,7 +71,7 @@ export default Plugin.define({
       await ctx.storage.remove(WATCH_KEY)
     }
 
-    const start = async (sessionID: string, delivery: Delivery) => {
+    const startWatch = async (sessionID: string): Promise<string> => {
       clearInterval(timer)
       let current: Map<string, BadDeployment>
       try {
@@ -79,30 +80,49 @@ export default Plugin.define({
         console.error("k8s-watch: listing deployments failed", error)
         await disarm()
         const message = error instanceof Error ? error.message : String(error)
-        await kick(
-          sessionID,
-          `k8s-watch could not list deployments: ${message}. Check that kubectl reaches your cluster (for example with \`kubectl get deployments\`), then run /k8s-watch in this session again.`,
-          delivery,
-        )
-        return
+        return `k8s-watch could not list deployments: ${message}. Check that kubectl reaches your cluster (for example with \`kubectl get deployments\`), then start the watch again.`
       }
       state = { sessionID, bad: Object.fromEntries(current) }
       await ctx.storage.set(WATCH_KEY, state)
       arm()
-      await kick(sessionID, formatReport([...current.values()]), delivery)
+      return formatReport([...current.values()])
     }
 
-    const registration = await ctx.command.transform((editor) => {
+    const commandRegistration = await ctx.command.transform((editor) => {
       editor.add({
         name: "k8s-watch",
         description: "Watch Kubernetes Deployments for failures and report them in this session. Stop the watch with: stop",
         execute: async ({ sessionID, prompt, delivery }) => {
           if (/\bstop\b/i.test(prompt.text)) {
             await disarm()
-            await kick(sessionID, "k8s-watch stopped. Failing Deployments are no longer reported.", delivery)
+            await kick(sessionID, STOP_MESSAGE, delivery)
             return
           }
-          await start(sessionID, delivery)
+          await kick(sessionID, await startWatch(sessionID), delivery)
+        },
+      })
+    })
+
+    const toolRegistration = await ctx.tool.transform((editor) => {
+      editor.namespace({ name: "k8s", description: "Watch Kubernetes Deployments for failures" })
+      editor.add({
+        name: "watch",
+        description:
+          "Watch Kubernetes Deployments for failures in this session. Use action=start to begin reporting newly failing Deployments here (returns the currently failing ones); action=stop to stop the watch.",
+        input: {
+          type: "object",
+          properties: { action: { type: "string", enum: ["start", "stop"] } },
+          required: ["action"],
+          additionalProperties: false,
+        },
+        options: { namespace: "k8s" },
+        execute: async (input, context) => {
+          const { action } = input as { action: "start" | "stop" }
+          if (action === "stop") {
+            await disarm()
+            return { content: STOP_MESSAGE }
+          }
+          return { content: await startWatch(context.sessionID) }
         },
       })
     })
@@ -115,7 +135,8 @@ export default Plugin.define({
 
     return async () => {
       clearInterval(timer)
-      await registration.dispose()
+      await commandRegistration.dispose()
+      await toolRegistration.dispose()
     }
   },
 })
