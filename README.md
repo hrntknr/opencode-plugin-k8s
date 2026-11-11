@@ -12,14 +12,42 @@ Run `/k8s-watch` in a session to start watching. The plugin:
 - pins the context and the watched namespaces when the watch starts, and reloads the kubeconfig on every poll only to refresh short-lived credentials (OIDC, exec); switching the machine's current context (`kubectl config use-context`) does not affect a running watch,
 - skips namespaces whose list call is forbidden (HTTP 403) instead of failing the watch when several namespaces are watched, and names both the watched and the skipped namespaces in the start report,
 - treats a Deployment as failing when its `Available` condition is `False`, its `Progressing` condition is `False` with reason `ProgressDeadlineExceeded`, or its `ReplicaFailure` condition is `True`,
-- injects an initial report of the currently failing Deployments into the starting session; the report includes the plugin version,
-- re-lists the Deployments on every poll and injects a prompt for each newly failing Deployment with `delivery: "queue"`, so the agent investigates it without interrupting an in-flight turn,
-- re-notifies with the old and the new conditions when the reasons of an already-failing Deployment change (for example `MinimumReplicasUnavailable` becoming `ProgressDeadlineExceeded`),
-- keeps the failing set in plugin storage, so a plugin reload resumes the watch without re-reporting already known failures.
+- injects an initial report of the currently failing Deployments into the starting session; the report has the same shape that `/k8s-watch status` later returns and opens with the plugin version, the pinned context, the watched namespaces and the poll interval,
+- re-lists the Deployments on every poll and queues a one-line prompt for each newly failing Deployment with `delivery: "queue"`, so the agent investigates it without interrupting an in-flight turn; every alert line carries the UTC detection time (`HH:MM:SSZ`) and the Deployment's age from its `creationTimestamp`,
+- re-queues one line when the reasons of an already-failing Deployment change (for example `MinimumReplicasUnavailable` becoming `ProgressDeadlineExceeded`), showing the old and the new conditions,
+- keeps the failing set (with the creation timestamps it needs for ages) in plugin storage, so a plugin reload resumes the watch without re-reporting already known failures.
 
 Deployments that recover leave the failing set silently; if the same Deployment fails again later, it is reported again.
 
-Run `/k8s-watch stop` to clear the timer and the stored watch state. Running `/k8s-watch` again replaces an active watch. If listing fails before the watch starts (for example no reachable cluster), the session gets one prompt explaining the failure and the watch does not start. The same applies when every watched namespace forbids the list (HTTP 403): the watch does not start, and the explanation names the namespaces, suggests asking the operator for access, and points at the `namespaces`/`allNamespaces` options. Naming a context the kubeconfig does not know fails the start the same way: the explanation lists the contexts the kubeconfig actually has. A failed poll only logs to the OpenCode server log and retries on the next tick.
+Run `/k8s-watch stop` to clear the timer and the stored watch state (`k8s-watch stopped.`). Running `/k8s-watch` again replaces an active watch. If listing fails before the watch starts (for example no reachable cluster), the session gets one sentence naming the error and asking to check that kubectl reaches the cluster. The same applies when every watched namespace forbids the list (HTTP 403): the answer names the scopes, suggests asking the operator for access, and points at the `namespaces`/`allNamespaces` options. Naming a context the kubeconfig does not know fails the start the same way: the answer lists the contexts the kubeconfig actually has. A failed poll only logs to the OpenCode server log and retries on the next tick.
+
+## Messages
+
+The injected texts are short and structured; names render as `namespace/name`, and conditions render as `Type=Status (Reason)` joined with `;`. Alerts carry the detection time — the UTC clock of the poll that noticed the failure — and the Deployment's age since its `creationTimestamp` (`44s`, `12m`, `3h`, `2d`).
+
+Starting a watch (and `k8s_watch action=status`) returns the current view:
+
+```text
+k8s-watch v1.5.0: context pfcp-pfn-iz1-01-managed-inference, namespace org-pfn--managed-inference, every 30s.
+Failing now:
+- org-pfn--managed-inference/prod17 (age 44s): Available=False (MinimumReplicasUnavailable); ReplicaFailure=True (FailedCreate)
+```
+
+`Failing now: none.` replaces the last two lines when nothing fails, and `Skipped (no list access): a, b.` is appended when some watched namespaces forbid listing. Entries stored before v1.5.0 have no age; those lines omit the ` (age …)` part.
+
+Each newly failing Deployment is queued into the session as:
+
+```text
+k8s-watch 05:58:23Z org-pfn--managed-inference/prod17 (age 44s): Available=False (MinimumReplicasUnavailable); ReplicaFailure=True (FailedCreate). Investigate.
+```
+
+An already-failing Deployment whose conditions change is re-queued as:
+
+```text
+k8s-watch 06:14:02Z org-pfn--managed-inference/prod17 (age 12m): still failing, changed: Available=False (MinimumReplicasUnavailable) → Progressing=False (ProgressDeadlineExceeded). Investigate.
+```
+
+`Investigate.` is the whole instruction; the agent decides how, usually `kubectl rollout status`, `kubectl describe`/events and pod logs. With no watch running, status answers `k8s-watch v1.5.0: no watch is running. Start one with action=start.`
 
 ## Install
 

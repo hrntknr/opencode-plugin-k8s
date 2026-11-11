@@ -8,8 +8,7 @@ import {
   formatForbidden,
   formatIdleStatus,
   formatReasonChange,
-  formatReport,
-  formatStatus,
+  formatWatch,
   formatUnknownContext,
   parseContextArg,
   reasonChanges,
@@ -57,7 +56,7 @@ type ListResult = {
 }
 
 const WATCH_KEY = "watch"
-const STOP_MESSAGE = "k8s-watch stopped. Failing Deployments are no longer reported."
+const STOP_MESSAGE = "k8s-watch stopped."
 
 const isForbidden = (error: unknown): boolean => error instanceof ApiException && error.code === 403
 
@@ -113,12 +112,13 @@ export default Plugin.define({
 
     const sync = async (current: Map<string, BadDeployment>) => {
       if (!state) return
+      const at = new Date()
       const previous = new Map(Object.entries(state.bad))
       for (const deployment of diffBad(current, previous)) {
-        await kick(state.sessionID, formatAlert(deployment), "queue")
+        await kick(state.sessionID, formatAlert(deployment, at), "queue")
       }
       for (const change of reasonChanges(current, previous)) {
-        await kick(state.sessionID, formatReasonChange(change), "queue")
+        await kick(state.sessionID, formatReasonChange(change, at), "queue")
       }
       state = { ...state, bad: Object.fromEntries(current) }
       await ctx.storage.set(WATCH_KEY, state)
@@ -162,7 +162,7 @@ export default Plugin.define({
         console.error("k8s-watch: listing deployments failed", error)
         await disarm()
         const message = error instanceof Error ? error.message : String(error)
-        return `k8s-watch could not list deployments: ${message}. Check that kubectl reaches your cluster (for example with \`kubectl get deployments\`), then start the watch again.`
+        return `k8s-watch could not list deployments: ${message}. Check that kubectl reaches your cluster, then start the watch again.`
       }
       if (result.blocked !== undefined) {
         await disarm()
@@ -172,7 +172,7 @@ export default Plugin.define({
       state = { sessionID, bad: Object.fromEntries(current), context: pinned.context, namespaces: pinned.namespaces }
       await ctx.storage.set(WATCH_KEY, state)
       arm()
-      return formatReport([...current.values()], { context: pinned.context, watched: result.watched, skipped: result.skipped })
+      return formatWatch([...current.values()], { context: pinned.context, watched: result.watched, intervalMs, skipped: result.skipped }, new Date())
     }
 
     const upgradeLegacy = async (stored: LegacyWatchState): Promise<void> => {
@@ -191,11 +191,12 @@ export default Plugin.define({
 
     const statusText = (): string => {
       if (!state) return formatIdleStatus()
-      return formatStatus(Object.values(state.bad), {
+      return formatWatch(Object.values(state.bad), {
         context: state.context,
         watched: describeNamespaces(state.namespaces),
         intervalMs,
-      })
+        skipped: [],
+      }, new Date())
     }
 
     const commandRegistration = await ctx.command.transform((editor) => {

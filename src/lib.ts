@@ -1,9 +1,10 @@
-export const VERSION = "1.4.0"
+export const VERSION = "1.5.0"
 
 export type BadDeployment = {
   namespace: string
   name: string
   reason: string
+  createdAt?: string
 }
 
 export type ReasonChange = {
@@ -11,10 +12,11 @@ export type ReasonChange = {
   name: string
   from: string
   to: string
+  createdAt?: string
 }
 
 export interface DeploymentLike {
-  metadata?: { uid?: string | null; name?: string | null; namespace?: string | null } | null
+  metadata?: { uid?: string | null; name?: string | null; namespace?: string | null; creationTimestamp?: string | Date | null } | null
   status?: { conditions?: DeploymentCondition[] | null } | null
 }
 
@@ -37,6 +39,10 @@ function describeCondition(condition: DeploymentCondition): string {
   return `${condition.type}=${condition.status}${reason}`
 }
 
+function creationIso(createdAt: string | Date): string {
+  return createdAt instanceof Date ? createdAt.toISOString().replace(/\.\d{3}Z$/, "Z") : createdAt
+}
+
 export function badDeployments(deployments: readonly DeploymentLike[]): Map<string, BadDeployment> {
   const bad = new Map<string, BadDeployment>()
   for (const deployment of deployments) {
@@ -44,7 +50,10 @@ export function badDeployments(deployments: readonly DeploymentLike[]): Map<stri
     if (reasons.length === 0) continue
     const namespace = deployment.metadata?.namespace ?? ""
     const name = deployment.metadata?.name ?? ""
-    bad.set(deployment.metadata?.uid ?? `${namespace}/${name}`, { namespace, name, reason: reasons.join("; ") })
+    const entry: BadDeployment = { namespace, name, reason: reasons.join("; ") }
+    const createdAt = deployment.metadata?.creationTimestamp
+    if (createdAt) entry.createdAt = creationIso(createdAt)
+    bad.set(deployment.metadata?.uid ?? `${namespace}/${name}`, entry)
   }
   return bad
 }
@@ -60,7 +69,9 @@ export function reasonChanges(current: Map<string, BadDeployment>, previous: Map
   for (const [key, deployment] of current) {
     const before = previous.get(key)
     if (before === undefined || before.reason === deployment.reason) continue
-    changes.push({ namespace: deployment.namespace, name: deployment.name, from: before.reason, to: deployment.reason })
+    const change: ReasonChange = { namespace: deployment.namespace, name: deployment.name, from: before.reason, to: deployment.reason }
+    if (deployment.createdAt !== undefined) change.createdAt = deployment.createdAt
+    changes.push(change)
   }
   return changes
 }
@@ -83,73 +94,72 @@ export function resolveWatchedNamespaces(options: NamespaceOptions, contextNames
 }
 
 export function describeNamespaces(namespaces: WatchedNamespaces): string {
-  return "all" in namespaces ? "all namespaces" : namespaces.namespaces.join(", ")
+  if ("all" in namespaces) return "all namespaces"
+  if (namespaces.namespaces.length === 1) return `namespace ${namespaces.namespaces[0]}`
+  return `namespaces ${namespaces.namespaces.join(", ")}`
 }
 
 export function parseContextArg(text: string): string | undefined {
   return text.match(/(?:^|\s)--context(?:\s+|=)(\S+)/)?.[1]
 }
 
-export interface ReportScope {
-  context: string
-  watched: string
-  skipped: string[]
+export function formatAge(createdAt: string, at: Date): string {
+  const seconds = Math.floor((at.getTime() - Date.parse(createdAt)) / 1000)
+  if (seconds < 60) return `${seconds}s`
+  if (seconds < 3_600) return `${Math.floor(seconds / 60)}m`
+  if (seconds < 86_400) return `${Math.floor(seconds / 3_600)}h`
+  return `${Math.floor(seconds / 86_400)}d`
 }
 
-function badListLines(bad: readonly BadDeployment[]): string[] {
-  if (bad.length === 0) return ["No Deployments are currently failing."]
-  return ["Failing Deployments, investigate these:", ...bad.map((deployment) => `- ${describeDeployment(deployment)}`)]
+function clockStamp(at: Date): string {
+  return `${at.toISOString().slice(11, 19)}Z`
 }
 
-export function formatReport(bad: readonly BadDeployment[], scope: ReportScope): string {
-  const lines = [
-    `k8s-watch (v${VERSION}): a watcher for failing Kubernetes Deployments has started. It reports newly failing Deployments in this session.`,
-    `Watching kubeconfig context ${scope.context}: ${scope.watched}.`,
-  ]
-  if (scope.skipped.length > 0)
-    lines.push(`Skipped forbidden namespaces (this user cannot list Deployments there): ${scope.skipped.join(", ")}.`)
-  return [...lines, ...badListLines(bad)].join("\n")
+function deploymentLabel(target: { namespace: string; name: string; createdAt?: string }, at: Date): string {
+  const age = target.createdAt === undefined ? "" : ` (age ${formatAge(target.createdAt, at)})`
+  return `${target.namespace}/${target.name}${age}`
 }
 
-export interface StatusScope {
+export function formatInterval(ms: number): string {
+  if (ms >= 60_000 && ms % 60_000 === 0) return `${ms / 60_000}m`
+  return `${Math.round(ms / 1000)}s`
+}
+
+export interface WatchScope {
   context: string
   watched: string
   intervalMs: number
+  skipped: string[]
 }
 
-export function formatStatus(bad: readonly BadDeployment[], scope: StatusScope): string {
-  return [
-    `k8s-watch (v${VERSION}): the watch is running.`,
-    `Watching kubeconfig context ${scope.context}: ${scope.watched}.`,
-    `Polling every ${scope.intervalMs} ms.`,
-    ...badListLines(bad),
-  ].join("\n")
+function badListLines(bad: readonly BadDeployment[], at: Date): string[] {
+  return bad.map((deployment) => `- ${deploymentLabel(deployment, at)}: ${deployment.reason}`)
+}
+
+export function formatWatch(bad: readonly BadDeployment[], scope: WatchScope, at: Date): string {
+  const lines = [`k8s-watch v${VERSION}: context ${scope.context}, ${scope.watched}, every ${formatInterval(scope.intervalMs)}.`]
+  if (scope.skipped.length > 0) lines.push(`Skipped (no list access): ${scope.skipped.join(", ")}.`)
+  if (bad.length === 0) lines.push("Failing now: none.")
+  else lines.push("Failing now:", ...badListLines(bad, at))
+  return lines.join("\n")
 }
 
 export function formatIdleStatus(): string {
-  return `k8s-watch (v${VERSION}): no watch is running. Start one with action=start.`
+  return `k8s-watch v${VERSION}: no watch is running. Start one with action=start.`
 }
 
-export function formatForbidden(namespaces: string): string {
-  return [
-    `k8s-watch could not start: this user is not allowed to list Deployments in ${namespaces} (HTTP 403).`,
-    "Ask the operator for permission to list Deployments there, or change the `namespaces`/`allNamespaces` plugin options to point at namespaces this user can list.",
-    "Check what you can list with `kubectl auth can-i list deployments`.",
-  ].join("\n")
+export function formatForbidden(scope: string): string {
+  return `k8s-watch: this user cannot list Deployments in ${scope}. Ask the operator for access, or change the namespaces/allNamespaces options. Check what you can list with kubectl auth can-i list deployments.`
 }
 
 export function formatUnknownContext(context: string, contexts: string[]): string {
-  return [
-    `k8s-watch could not start: the kubeconfig has no context ${context}.`,
-    `Available contexts: ${contexts.join(", ")}.`,
-    "Pass one of them with the `--context` flag, the `context` tool parameter, or the `context` plugin option, then start the watch again.",
-  ].join("\n")
+  return `k8s-watch: no such context "${context}". Available contexts: ${contexts.join(", ")}. Pass one with --context, the tool's context parameter, or the context plugin option.`
 }
 
-export function formatAlert(deployment: BadDeployment): string {
-  return `k8s-watch: Deployment ${deployment.namespace}/${deployment.name} just became unhealthy: ${deployment.reason}. Investigate it (rollout status, events, pod logs) and report what is wrong.`
+export function formatAlert(deployment: BadDeployment, at: Date): string {
+  return `k8s-watch ${clockStamp(at)} ${deploymentLabel(deployment, at)}: ${deployment.reason}. Investigate.`
 }
 
-export function formatReasonChange(change: ReasonChange): string {
-  return `k8s-watch: Deployment ${change.namespace}/${change.name} is still failing, conditions changed: ${change.from} → ${change.to}. Check whether it needs intervention.`
+export function formatReasonChange(change: ReasonChange, at: Date): string {
+  return `k8s-watch ${clockStamp(at)} ${deploymentLabel(change, at)}: still failing, changed: ${change.from} → ${change.to}. Investigate.`
 }

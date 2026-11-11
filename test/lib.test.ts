@@ -5,13 +5,14 @@ import {
   describeDeployment,
   describeNamespaces,
   diffBad,
+  formatAge,
   formatAlert,
   formatForbidden,
   formatIdleStatus,
+  formatInterval,
   formatReasonChange,
-  formatReport,
-  formatStatus,
   formatUnknownContext,
+  formatWatch,
   parseContextArg,
   reasonChanges,
   resolveWatchedNamespaces,
@@ -25,6 +26,23 @@ import availableFalse from "./fixtures/available-false.json" with { type: "json"
 import paused from "./fixtures/paused.json" with { type: "json" }
 import progressingDeadline from "./fixtures/progressing-deadline.json" with { type: "json" }
 import replicaFailure from "./fixtures/replica-failure.json" with { type: "json" }
+
+const detectedAt = new Date("2026-11-11T05:58:23Z")
+const prod17Reason = "Available=False (MinimumReplicasUnavailable); ReplicaFailure=True (FailedCreate)"
+const prod17: DeploymentLike = {
+  metadata: {
+    uid: "77777777-7777-7777-7777-777777777777",
+    namespace: "org-pfn--managed-inference",
+    name: "prod17",
+    creationTimestamp: "2026-11-11T05:57:39Z",
+  },
+  status: {
+    conditions: [
+      { type: "Available", status: "False", reason: "MinimumReplicasUnavailable" },
+      { type: "ReplicaFailure", status: "True", reason: "FailedCreate" },
+    ],
+  },
+}
 
 test("healthy and paused deployments are not bad", () => {
   assert.equal(badDeployments([healthy, paused]).size, 0)
@@ -72,6 +90,24 @@ test("multiple bad conditions are reported together", () => {
   assert.equal(bad?.reason, "Available=False (MinimumReplicasUnavailable); ReplicaFailure=True")
 })
 
+test("bad deployments keep the creation timestamp", () => {
+  const [bad] = badDeployments([prod17]).values()
+  assert.equal(bad?.createdAt, "2026-11-11T05:57:39Z")
+  assert.equal(bad?.reason, prod17Reason)
+  const [dated] = badDeployments([
+    {
+      metadata: {
+        uid: "99999999-9999-9999-9999-999999999999",
+        namespace: "org-pfn--managed-inference",
+        name: "prod17",
+        creationTimestamp: new Date("2026-11-11T05:57:39Z"),
+      },
+      status: prod17.status,
+    },
+  ]).values()
+  assert.equal(dated?.createdAt, "2026-11-11T05:57:39Z")
+})
+
 test("newly bad deployments fire", () => {
   const fresh = diffBad(badDeployments([availableFalse, progressingDeadline]), new Map())
   assert.deepEqual(fresh.map(describeDeployment), [
@@ -113,6 +149,14 @@ const deadlineExceeded: DeploymentLike = {
   metadata: { uid: "22222222-2222-2222-2222-222222222222", namespace: "default", name: "no-replicas" },
   status: { conditions: [{ type: "Progressing", status: "False", reason: "ProgressDeadlineExceeded" }] },
 }
+const agedMinimumReplicas: DeploymentLike = {
+  metadata: { uid: "22222222-2222-2222-2222-222222222222", namespace: "default", name: "no-replicas", creationTimestamp: "2026-11-11T05:57:39Z" },
+  status: minimumReplicas.status,
+}
+const agedDeadlineExceeded: DeploymentLike = {
+  metadata: { uid: "22222222-2222-2222-2222-222222222222", namespace: "default", name: "no-replicas", creationTimestamp: "2026-11-11T05:57:39Z" },
+  status: deadlineExceeded.status,
+}
 
 test("a reason change on a still-bad deployment fires once", () => {
   let previous = badDeployments([minimumReplicas])
@@ -133,6 +177,12 @@ test("a reason change on a still-bad deployment fires once", () => {
   assert.equal(poll([deadlineExceeded]).length, 0)
 })
 
+test("reason changes keep the creation timestamp", () => {
+  const previous = badDeployments([agedMinimumReplicas])
+  const [change] = reasonChanges(badDeployments([agedDeadlineExceeded]), previous)
+  assert.equal(change?.createdAt, "2026-11-11T05:57:39Z")
+})
+
 test("newly bad and reason changed are disjoint in the same poll", () => {
   const previous = badDeployments([minimumReplicas])
   const current = badDeployments([deadlineExceeded, progressingDeadline])
@@ -149,30 +199,62 @@ test("newly bad and reason changed are disjoint in the same poll", () => {
   ])
 })
 
-test("reason-change alerts say the deployment is still failing", () => {
+test("alerts open with k8s-watch, the detection time and the deployment age", () => {
+  const [bad] = badDeployments([prod17]).values()
   assert.equal(
-    formatReasonChange({
-      namespace: "default",
-      name: "no-replicas",
-      from: "Available=False (MinimumReplicasUnavailable)",
-      to: "Progressing=False (ProgressDeadlineExceeded)",
-    }),
-    "k8s-watch: Deployment default/no-replicas is still failing, conditions changed: Available=False (MinimumReplicasUnavailable) → Progressing=False (ProgressDeadlineExceeded). Check whether it needs intervention.",
+    formatAlert(bad!, detectedAt),
+    `k8s-watch 05:58:23Z org-pfn--managed-inference/prod17 (age 44s): ${prod17Reason}. Investigate.`,
   )
 })
 
-test("report and alert text list namespace, name and reason", () => {
-  const [bad] = badDeployments([availableFalse]).values()
-  assert.equal(formatReport([], { context: "dev", watched: "default", skipped: [] }).startsWith(`k8s-watch (v${VERSION}):`), true)
-  assert.equal(formatReport([], { context: "dev", watched: "default", skipped: [] }).endsWith("No Deployments are currently failing."), true)
+test("reason-change alerts carry time, age and both reasons", () => {
   assert.equal(
-    formatReport([bad!], { context: "dev", watched: "default", skipped: [] }).includes("- default/no-replicas: Available=False (MinimumReplicasUnavailable)"),
-    true,
+    formatReasonChange(
+      {
+        namespace: "org-pfn--managed-inference",
+        name: "prod17",
+        from: "Available=False (MinimumReplicasUnavailable)",
+        to: "Progressing=False (ProgressDeadlineExceeded)",
+        createdAt: "2026-11-11T06:02:02Z",
+      },
+      new Date("2026-11-11T06:14:02Z"),
+    ),
+    "k8s-watch 06:14:02Z org-pfn--managed-inference/prod17 (age 12m): still failing, changed: Available=False (MinimumReplicasUnavailable) → Progressing=False (ProgressDeadlineExceeded). Investigate.",
+  )
+})
+
+test("entries without a creation timestamp omit the age", () => {
+  assert.equal(
+    formatAlert({ namespace: "default", name: "no-replicas", reason: "Available=False (MinimumReplicasUnavailable)" }, detectedAt),
+    "k8s-watch 05:58:23Z default/no-replicas: Available=False (MinimumReplicasUnavailable). Investigate.",
   )
   assert.equal(
-    formatAlert(bad!),
-    "k8s-watch: Deployment default/no-replicas just became unhealthy: Available=False (MinimumReplicasUnavailable). Investigate it (rollout status, events, pod logs) and report what is wrong.",
+    formatReasonChange(
+      {
+        namespace: "default",
+        name: "no-replicas",
+        from: "Available=False (MinimumReplicasUnavailable)",
+        to: "Progressing=False (ProgressDeadlineExceeded)",
+      },
+      detectedAt,
+    ),
+    "k8s-watch 05:58:23Z default/no-replicas: still failing, changed: Available=False (MinimumReplicasUnavailable) → Progressing=False (ProgressDeadlineExceeded). Investigate.",
   )
+})
+
+test("age formatting buckets to seconds, minutes, hours and days", () => {
+  const at = new Date("2026-11-11T12:00:00Z")
+  assert.equal(formatAge("2026-11-11T11:59:16Z", at), "44s")
+  assert.equal(formatAge("2026-11-11T11:48:00Z", at), "12m")
+  assert.equal(formatAge("2026-11-11T09:00:00Z", at), "3h")
+  assert.equal(formatAge("2026-11-09T12:00:00Z", at), "2d")
+})
+
+test("poll intervals compact to seconds or whole minutes", () => {
+  assert.equal(formatInterval(30_000), "30s")
+  assert.equal(formatInterval(45_000), "45s")
+  assert.equal(formatInterval(60_000), "1m")
+  assert.equal(formatInterval(120_000), "2m")
 })
 
 test("allNamespaces resolves to the cluster scope", () => {
@@ -189,42 +271,64 @@ test("without options the kubeconfig context namespace is watched", () => {
   assert.deepEqual(resolveWatchedNamespaces({ allNamespaces: false, namespaces: [] }, undefined), { namespaces: ["default"] })
 })
 
-test("watched namespaces are described for reports", () => {
+test("watched scopes read as namespace, namespaces, or all namespaces", () => {
   assert.equal(describeNamespaces({ all: true }), "all namespaces")
-  assert.equal(describeNamespaces({ namespaces: ["default", "prod"] }), "default, prod")
+  assert.equal(describeNamespaces({ namespaces: ["default"] }), "namespace default")
+  assert.equal(describeNamespaces({ namespaces: ["default", "prod"] }), "namespaces default, prod")
 })
 
-test("report names the pinned context, the watched and the forbidden skipped namespaces", () => {
-  const text = formatReport([], { context: "tenant-a", watched: "default, prod", skipped: ["stage"] })
-  assert.equal(text.includes("Watching kubeconfig context tenant-a: default, prod."), true)
-  assert.equal(text.includes("Skipped forbidden namespaces (this user cannot list Deployments there): stage."), true)
-  assert.equal(text.endsWith("No Deployments are currently failing."), true)
+test("start and status share one formatter", () => {
+  const [bad] = badDeployments([prod17]).values()
+  assert.equal(
+    formatWatch([bad!], { context: "pfcp-pfn-iz1-01-managed-inference", watched: "namespace org-pfn--managed-inference", intervalMs: 30_000, skipped: [] }, detectedAt),
+    [
+      `k8s-watch v${VERSION}: context pfcp-pfn-iz1-01-managed-inference, namespace org-pfn--managed-inference, every 30s.`,
+      "Failing now:",
+      `- org-pfn--managed-inference/prod17 (age 44s): ${prod17Reason}`,
+    ].join("\n"),
+  )
 })
 
-test("status text names the context, the watched namespaces, the interval and the current failures", () => {
+test("the formatter collapses to none and appends skipped namespaces", () => {
+  assert.equal(
+    formatWatch([], { context: "dev", watched: "namespaces default, prod", intervalMs: 30_000, skipped: ["stage", "sandbox"] }, detectedAt),
+    [
+      `k8s-watch v${VERSION}: context dev, namespaces default, prod, every 30s.`,
+      "Skipped (no list access): stage, sandbox.",
+      "Failing now: none.",
+    ].join("\n"),
+  )
+})
+
+test("an all-namespaces view names the cluster scope", () => {
+  assert.equal(
+    formatWatch([], { context: "dev", watched: describeNamespaces({ all: true }), intervalMs: 120_000, skipped: [] }, detectedAt),
+    [`k8s-watch v${VERSION}: context dev, all namespaces, every 2m.`, "Failing now: none."].join("\n"),
+  )
+})
+
+test("list lines omit the age without a creation timestamp", () => {
   const [bad] = badDeployments([availableFalse]).values()
-  const text = formatStatus([bad!], { context: "dev", watched: "default", intervalMs: 45000 })
-  assert.equal(text.startsWith(`k8s-watch (v${VERSION}): the watch is running.`), true)
-  assert.equal(text.includes("Watching kubeconfig context dev: default."), true)
-  assert.equal(text.includes("Polling every 45000 ms."), true)
-  assert.equal(text.includes("- default/no-replicas: Available=False (MinimumReplicasUnavailable)"), true)
-})
-
-test("status text with nothing failing says so", () => {
-  const text = formatStatus([], { context: "dev", watched: "all namespaces", intervalMs: 30000 })
-  assert.equal(text.endsWith("No Deployments are currently failing."), true)
+  const text = formatWatch([bad!], { context: "dev", watched: "namespace default", intervalMs: 30_000, skipped: [] }, detectedAt)
+  assert.equal(
+    text,
+    [
+      `k8s-watch v${VERSION}: context dev, namespace default, every 30s.`,
+      "Failing now:",
+      "- default/no-replicas: Available=False (MinimumReplicasUnavailable)",
+    ].join("\n"),
+  )
 })
 
 test("idle status text carries the version and how to start", () => {
-  assert.equal(formatIdleStatus(), `k8s-watch (v${VERSION}): no watch is running. Start one with action=start.`)
+  assert.equal(formatIdleStatus(), `k8s-watch v${VERSION}: no watch is running. Start one with action=start.`)
 })
 
 test("all-forbidden failure text explains the RBAC situation and the options", () => {
-  const text = formatForbidden("stage, sandbox")
-  assert.equal(text.includes("not allowed to list Deployments in stage, sandbox (HTTP 403)"), true)
-  assert.equal(text.includes("Ask the operator"), true)
-  assert.equal(text.includes("namespaces`/`allNamespaces`"), true)
-  assert.equal(text.includes("`kubectl auth can-i list deployments`"), true)
+  assert.equal(
+    formatForbidden("namespaces stage, sandbox"),
+    "k8s-watch: this user cannot list Deployments in namespaces stage, sandbox. Ask the operator for access, or change the namespaces/allNamespaces options. Check what you can list with kubectl auth can-i list deployments.",
+  )
 })
 
 test("the --context flag is parsed from command text", () => {
@@ -237,8 +341,8 @@ test("the --context flag is parsed from command text", () => {
 })
 
 test("unknown-context failure text names the requested context and lists the available ones", () => {
-  const text = formatUnknownContext("tenant-z", ["tenant-a", "tenant-b"])
-  assert.equal(text.includes("k8s-watch could not start: the kubeconfig has no context tenant-z."), true)
-  assert.equal(text.includes("Available contexts: tenant-a, tenant-b."), true)
-  assert.equal(text.includes("`--context` flag"), true)
+  assert.equal(
+    formatUnknownContext("tenant-z", ["tenant-a", "tenant-b"]),
+    `k8s-watch: no such context "tenant-z". Available contexts: tenant-a, tenant-b. Pass one with --context, the tool's context parameter, or the context plugin option.`,
+  )
 })
