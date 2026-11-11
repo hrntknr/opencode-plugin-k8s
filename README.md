@@ -21,6 +21,10 @@ Deployments that recover leave the failing set silently; if the same Deployment 
 
 Run `/k8s-watch stop` to clear the timer and the stored watch state (`k8s-watch stopped.`). Running `/k8s-watch` again replaces an active watch. If listing fails before the watch starts (for example no reachable cluster), the session gets one sentence naming the error and asking to check that kubectl reaches the cluster. The same applies when every watched namespace forbids the list (HTTP 403): the answer names the scopes, suggests asking the operator for access, and points at the `namespaces`/`allNamespaces` options. Naming a context the kubeconfig does not know fails the start the same way: the answer lists the contexts the kubeconfig actually has. A failed poll only logs to the OpenCode server log and retries on the next tick.
 
+## Multiple OpenCode servers
+
+When several OpenCode server processes load the plugin, exactly one of them runs the watch. The stored watch is a lease: it records the holder's `owner` id and a `heartbeat` refreshed on every poll, and an instance takes the watch over only when that heartbeat is older than three poll intervals. Non-holders only observe the stored watch, never the Kubernetes API: they stand down when another instance holds the lease, keep a lightweight takeover check running, and are promoted within the staleness window when the holder disappears. Because everyone observes the same storage, `/k8s-watch stop` stops the watch on all servers: deleting the stored watch is seen by the holder on its next poll and by the others on their next check. A state stored before v1.6.0 carries no lease, so the first v1.6 instance claims it and a multi-server setup converges to one holder within a poll or two.
+
 ## Messages
 
 The injected texts are short and structured; names render as `namespace/name`, and conditions render as `Type=Status (Reason)` joined with `;`. Alerts carry the detection time — the UTC clock of the poll that noticed the failure — and the Deployment's age since its `creationTimestamp` (`44s`, `12m`, `3h`, `2d`).
@@ -28,7 +32,7 @@ The injected texts are short and structured; names render as `namespace/name`, a
 Starting a watch (and `k8s_watch action=status`) returns the current view:
 
 ```text
-k8s-watch v1.5.0: context pfcp-pfn-iz1-01-managed-inference, namespace org-pfn--managed-inference, every 30s.
+k8s-watch v1.6.0: context pfcp-pfn-iz1-01-managed-inference, namespace org-pfn--managed-inference, every 30s.
 Failing now:
 - org-pfn--managed-inference/prod17 (age 44s): Available=False (MinimumReplicasUnavailable); ReplicaFailure=True (FailedCreate)
 ```
@@ -47,7 +51,7 @@ An already-failing Deployment whose conditions change is re-queued as:
 k8s-watch 06:14:02Z org-pfn--managed-inference/prod17 (age 12m): still failing, changed: Available=False (MinimumReplicasUnavailable) → Progressing=False (ProgressDeadlineExceeded). Investigate.
 ```
 
-`Investigate.` is the whole instruction; the agent decides how, usually `kubectl rollout status`, `kubectl describe`/events and pod logs. With no watch running, status answers `k8s-watch v1.5.0: no watch is running. Start one with action=start.`
+`Investigate.` is the whole instruction; the agent decides how, usually `kubectl rollout status`, `kubectl describe`/events and pod logs. With no watch running, status answers `k8s-watch v1.6.0: no watch is running. Start one with action=start.`
 
 ## Install
 

@@ -2,6 +2,7 @@ import { Plugin } from "@opencode/plugin"
 import { ApiException, AppsV1Api, KubeConfig, type V1Deployment } from "@kubernetes/client-node"
 import {
   badDeployments,
+  claimable,
   describeNamespaces,
   diffBad,
   formatAlert,
@@ -11,6 +12,7 @@ import {
   formatWatch,
   formatUnknownContext,
   parseContextArg,
+  pollDecision,
   reasonChanges,
   resolveWatchedNamespaces,
   type BadDeployment,
@@ -36,17 +38,23 @@ type UnknownContext = {
   contexts: string[]
 }
 
-type WatchState = {
+type StoredWatchState = {
   sessionID: string
   bad: Record<string, BadDeployment>
   context: string
   namespaces: WatchedNamespaces
+  owner?: string
+  heartbeat?: number
 }
+
+type WatchState = StoredWatchState & { owner: string; heartbeat: number }
 
 type LegacyWatchState = {
   sessionID: string
   bad: Record<string, BadDeployment>
 }
+
+type StoredWatch = StoredWatchState | LegacyWatchState
 
 type ListResult = {
   deployments: V1Deployment[]
@@ -65,9 +73,11 @@ export default Plugin.define({
   async setup(ctx) {
     const options = ctx.options as Options
     const intervalMs = options.intervalMs ?? 30_000
+    const instanceID = crypto.randomUUID()
 
     let timer: ReturnType<typeof setInterval> | undefined
     let state: WatchState | undefined
+    let epoch = 0
 
     const resolvePinnedContext = (requested: string | undefined): PinnedContext | UnknownContext => {
       const kubeConfig = new KubeConfig()
@@ -110,6 +120,29 @@ export default Plugin.define({
 
     const kick = (sessionID: string, text: string, delivery: Delivery) => ctx.session.prompt({ sessionID, text, delivery })
 
+    const readWatch = (): Promise<StoredWatch | undefined> => ctx.storage.get(WATCH_KEY) as Promise<StoredWatch | undefined>
+
+    const stopTimer = () => {
+      clearInterval(timer)
+      timer = undefined
+    }
+
+    const schedule = (run: () => void) => {
+      stopTimer()
+      timer = setInterval(run, intervalMs)
+    }
+
+    const standDown = () => {
+      stopTimer()
+      state = undefined
+    }
+
+    const disarm = async () => {
+      epoch++
+      standDown()
+      await ctx.storage.remove(WATCH_KEY)
+    }
+
     const sync = async (current: Map<string, BadDeployment>) => {
       if (!state) return
       const at = new Date()
@@ -120,13 +153,22 @@ export default Plugin.define({
       for (const change of reasonChanges(current, previous)) {
         await kick(state.sessionID, formatReasonChange(change, at), "queue")
       }
+      if (!state) return
       state = { ...state, bad: Object.fromEntries(current) }
       await ctx.storage.set(WATCH_KEY, state)
     }
 
     const poll = async () => {
       if (!state) return
+      const at = epoch
       try {
+        const stored = await readWatch()
+        if (epoch !== at || !state || pollDecision(stored, instanceID, state.sessionID) === "step-down") {
+          standDown()
+          return
+        }
+        state = { ...state, heartbeat: Date.now() }
+        await ctx.storage.set(WATCH_KEY, state)
         const { deployments } = await listDeployments(state)
         await sync(badDeployments(deployments))
       } catch (error) {
@@ -134,20 +176,46 @@ export default Plugin.define({
       }
     }
 
-    const arm = () => {
-      clearInterval(timer)
-      timer = setInterval(() => void poll(), intervalMs)
+    const hydrate = async (stored: StoredWatch): Promise<StoredWatchState | undefined> => {
+      if ("context" in stored) return stored
+      try {
+        const pinned = resolvePinnedContext(undefined)
+        if ("unknownContext" in pinned) {
+          await ctx.storage.remove(WATCH_KEY)
+          return undefined
+        }
+        return { ...stored, ...pinned }
+      } catch (error) {
+        console.error("k8s-watch: resuming the stored watch failed", error)
+        return undefined
+      }
     }
 
-    const disarm = async () => {
-      clearInterval(timer)
-      timer = undefined
-      state = undefined
-      await ctx.storage.remove(WATCH_KEY)
+    const claim = async (stored: StoredWatch): Promise<void> => {
+      const at = epoch
+      const candidate = await hydrate(stored)
+      if (candidate === undefined || epoch !== at) return
+      state = { ...candidate, owner: instanceID, heartbeat: Date.now() }
+      await ctx.storage.set(WATCH_KEY, state)
+      schedule(() => void poll())
+    }
+
+    const watchdog = async (): Promise<void> => {
+      try {
+        const stored = await readWatch()
+        if (stored === undefined) {
+          stopTimer()
+          return
+        }
+        if (!claimable(stored, Date.now(), intervalMs)) return
+        await claim(stored)
+      } catch (error) {
+        console.error("k8s-watch: checking on the stored watch failed", error)
+      }
     }
 
     const startWatch = async (sessionID: string, requested: string | undefined): Promise<string> => {
-      clearInterval(timer)
+      const at = epoch
       let pinned: PinnedContext
       let result: ListResult
       try {
@@ -168,25 +236,19 @@ export default Plugin.define({
         await disarm()
         return formatForbidden(result.blocked)
       }
+      if (epoch !== at) return STOP_MESSAGE
       const current = badDeployments(result.deployments)
-      state = { sessionID, bad: Object.fromEntries(current), context: pinned.context, namespaces: pinned.namespaces }
-      await ctx.storage.set(WATCH_KEY, state)
-      arm()
-      return formatWatch([...current.values()], { context: pinned.context, watched: result.watched, intervalMs, skipped: result.skipped }, new Date())
-    }
-
-    const upgradeLegacy = async (stored: LegacyWatchState): Promise<void> => {
-      try {
-        const pinned = resolvePinnedContext(undefined)
-        if ("unknownContext" in pinned) {
-          await disarm()
-          return
-        }
-        state = { ...stored, ...pinned }
-        await ctx.storage.set(WATCH_KEY, state)
-      } catch (error) {
-        console.error("k8s-watch: resuming the stored watch failed", error)
+      state = {
+        sessionID,
+        bad: Object.fromEntries(current),
+        context: pinned.context,
+        namespaces: pinned.namespaces,
+        owner: instanceID,
+        heartbeat: Date.now(),
       }
+      await ctx.storage.set(WATCH_KEY, state)
+      schedule(() => void poll())
+      return formatWatch([...current.values()], { context: pinned.context, watched: result.watched, intervalMs, skipped: result.skipped }, new Date())
     }
 
     const statusText = (): string => {
@@ -247,15 +309,14 @@ export default Plugin.define({
       })
     })
 
-    const stored = (await ctx.storage.get(WATCH_KEY)) as WatchState | LegacyWatchState | undefined
-    if (stored) {
-      if ("context" in stored) state = stored
-      else await upgradeLegacy(stored)
-      if (state) arm()
+    const storedWatch = await readWatch()
+    if (storedWatch !== undefined) {
+      if (claimable(storedWatch, Date.now(), intervalMs)) await claim(storedWatch)
+      else schedule(() => void watchdog())
     }
 
     return async () => {
-      clearInterval(timer)
+      stopTimer()
       await commandRegistration.dispose()
       await toolRegistration.dispose()
     }

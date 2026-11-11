@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 import {
   badDeployments,
+  claimable,
   describeDeployment,
   describeNamespaces,
   diffBad,
@@ -14,6 +15,7 @@ import {
   formatUnknownContext,
   formatWatch,
   parseContextArg,
+  pollDecision,
   reasonChanges,
   resolveWatchedNamespaces,
   VERSION,
@@ -340,9 +342,40 @@ test("the --context flag is parsed from command text", () => {
   assert.equal(parseContextArg("/k8s-watch --context"), undefined)
 })
 
+const intervalMs = 30_000
+const now = 1_700_000_000_000
+const heldLease = { sessionID: "session", owner: "watcher-a", heartbeat: now }
+
+test("a stored watch without a lease is claimable", () => {
+  assert.equal(claimable(undefined, now, intervalMs), true)
+  assert.equal(claimable({ sessionID: "session" }, now, intervalMs), true)
+})
+
+test("a live holder blocks claims by refreshing its heartbeat", () => {
+  assert.equal(claimable(heldLease, now, intervalMs), false)
+  assert.equal(claimable({ ...heldLease, heartbeat: now - 2 * intervalMs }, now, intervalMs), false)
+})
+
+test("the heartbeat goes claimable once it is older than three intervals", () => {
+  assert.equal(claimable({ ...heldLease, heartbeat: now - 3 * intervalMs }, now, intervalMs), false)
+  assert.equal(claimable({ ...heldLease, heartbeat: now - 3 * intervalMs - 1 }, now, intervalMs), true)
+})
+
+test("the holder keeps polling only while the stored watch is its own", () => {
+  assert.equal(pollDecision(heldLease, "watcher-a", "session"), "armed")
+  assert.equal(pollDecision(undefined, "watcher-a", "session"), "step-down")
+  assert.equal(pollDecision(heldLease, "watcher-b", "session"), "step-down")
+  assert.equal(pollDecision(heldLease, "watcher-a", "session-2"), "step-down")
+  assert.equal(pollDecision({ sessionID: "session" }, "watcher-a", "session"), "step-down")
+})
+
 test("unknown-context failure text names the requested context and lists the available ones", () => {
   assert.equal(
     formatUnknownContext("tenant-z", ["tenant-a", "tenant-b"]),
     `k8s-watch: no such context "tenant-z". Available contexts: tenant-a, tenant-b. Pass one with --context, the tool's context parameter, or the context plugin option.`,
   )
+})
+
+test("the release version is stamped into every text", () => {
+  assert.equal(VERSION, "1.6.0")
 })

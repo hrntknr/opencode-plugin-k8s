@@ -1,4 +1,4 @@
-export const VERSION = "1.5.0"
+export const VERSION = "1.6.0"
 
 export type BadDeployment = {
   namespace: string
@@ -101,6 +101,25 @@ export function describeNamespaces(namespaces: WatchedNamespaces): string {
 
 export function parseContextArg(text: string): string | undefined {
   return text.match(/(?:^|\s)--context(?:\s+|=)(\S+)/)?.[1]
+}
+
+export interface WatchLease {
+  sessionID: string
+  owner?: string
+  heartbeat?: number
+}
+
+export function claimable(lease: WatchLease | undefined, now: number, intervalMs: number): boolean {
+  if (lease === undefined) return true
+  if (lease.owner === undefined || lease.heartbeat === undefined) return true
+  return now - lease.heartbeat > 3 * intervalMs
+}
+
+export function pollDecision(lease: WatchLease | undefined, instanceID: string, sessionID: string): "armed" | "step-down" {
+  if (lease === undefined) return "step-down"
+  if (lease.sessionID !== sessionID) return "step-down"
+  if (lease.owner !== instanceID) return "step-down"
+  return "armed"
 }
 
 export function formatAge(createdAt: string, at: Date): string {
